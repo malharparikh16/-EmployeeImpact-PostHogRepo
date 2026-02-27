@@ -327,36 +327,186 @@ def compute_impact(prs: list[dict]) -> list[dict]:
         )
 
         # -----------------------------------------------------------------
-        # Composite impact score
+        # Composite impact score — compute every component individually
+        # so the dashboard can display an exact, auditable breakdown
         # -----------------------------------------------------------------
-        # Authored score — each PR earns its base weight × type multiplier
-        # We need the per-PR breakdown for this, so we re-scan pr_types.
-        # We stored pr_types as a count dict; multiply each type bucket.
-        authored_score = 0.0
+
+        # Per-PR-type authored scores (merged)
+        merged_by_type: dict[str, dict] = defaultdict(lambda: {"count": 0, "pts": 0.0})
+        opened_by_type: dict[str, dict] = defaultdict(lambda: {"count": 0, "pts": 0.0})
         for pr in prs:
             if pr["author"] != e["login"] or is_bot(pr["author"]):
                 continue
-            mult = pr_type_multiplier(pr["title"])
+            pt = parse_pr_type(pr["title"])
+            mult = PR_TYPE_MULTIPLIERS.get(pt, 1.0)
             if pr["state"] == "MERGED":
-                authored_score += WEIGHTS["pr_merged"] * mult
+                merged_by_type[pt]["count"] += 1
+                merged_by_type[pt]["pts"] += round(WEIGHTS["pr_merged"] * mult, 4)
             else:
-                authored_score += WEIGHTS["pr_opened"] * mult
+                opened_by_type[pt]["count"] += 1
+                opened_by_type[pt]["pts"] += round(WEIGHTS["pr_opened"] * mult, 4)
 
-        authored_score += (net_lines / 1000) * WEIGHTS["lines_per_1k"]
-        authored_score += e["total_files_changed"] * WEIGHTS["files_changed"]
+        # Round every leaf component to 1dp first, then sum — this ensures
+        # sum(score_components[].pts) == authored_score == impact_score exactly.
+        authored_merged_pts  = round(sum(v["pts"] for v in merged_by_type.values()), 1)
+        authored_opened_pts  = round(sum(v["pts"] for v in opened_by_type.values()), 1)
+        lines_pts            = round((net_lines / 1000) * WEIGHTS["lines_per_1k"], 1)
+        files_pts            = round(e["total_files_changed"] * WEIGHTS["files_changed"], 1)
 
-        # Review score
-        review_score = (
-            e["first_approvals"]            * WEIGHTS["first_approval"]
-            + e["subsequent_approvals"]     * WEIGHTS["subsequent_approval"]
-            + e["change_requests_with_body"]* WEIGHTS["change_request_body"]
-            + e["change_requests_empty"]    * WEIGHTS["change_request_empty"]
-            + e["comments_with_body"]       * WEIGHTS["comment_body"]
-            + e["comments_empty"]           * WEIGHTS["comment_empty"]
-            + unique_prs_reviewed           * WEIGHTS["unique_prs_reviewed"]
+        authored_score = round(authored_merged_pts + authored_opened_pts + lines_pts + files_pts, 1)
+
+        # Review score — every component rounded at leaf level
+        first_approval_pts      = round(e["first_approvals"]             * WEIGHTS["first_approval"],       1)
+        subseq_approval_pts     = round(e["subsequent_approvals"]        * WEIGHTS["subsequent_approval"],  1)
+        cr_body_pts             = round(e["change_requests_with_body"]   * WEIGHTS["change_request_body"],  1)
+        cr_empty_pts            = round(e["change_requests_empty"]       * WEIGHTS["change_request_empty"], 1)
+        comment_body_pts        = round(e["comments_with_body"]          * WEIGHTS["comment_body"],         1)
+        comment_empty_pts       = round(e["comments_empty"]              * WEIGHTS["comment_empty"],        1)
+        breadth_pts             = round(unique_prs_reviewed              * WEIGHTS["unique_prs_reviewed"],  1)
+
+        review_score = round(
+            first_approval_pts + subseq_approval_pts
+            + cr_body_pts + cr_empty_pts
+            + comment_body_pts + comment_empty_pts
+            + breadth_pts, 1
         )
 
+        # Total is exact sum of the two sub-totals — no re-rounding surprises
         total_score = round(authored_score + review_score, 1)
+
+        # Exact breakdown list — every non-zero component, stored on the engineer
+        # so the dashboard never needs to re-derive anything
+        score_components = []
+        for pt, data in sorted(merged_by_type.items(), key=lambda x: x[1]["pts"], reverse=True):
+            if data["pts"] > 0:
+                mult = PR_TYPE_MULTIPLIERS.get(pt, 1.0)
+                score_components.append({
+                    "label":  f"{pt} PRs merged",
+                    "group":  "authored",
+                    "count":  data["count"],
+                    "weight": WEIGHTS["pr_merged"],
+                    "mult":   mult,
+                    "calc":   f"{data['count']} × {WEIGHTS['pr_merged']} × {mult}×",
+                    "pts":    round(data["pts"], 1),
+                    "color":  "authored",
+                })
+        for pt, data in sorted(opened_by_type.items(), key=lambda x: x[1]["pts"], reverse=True):
+            if data["pts"] > 0:
+                mult = PR_TYPE_MULTIPLIERS.get(pt, 1.0)
+                score_components.append({
+                    "label":  f"{pt} PRs opened (not merged)",
+                    "group":  "authored",
+                    "count":  data["count"],
+                    "weight": WEIGHTS["pr_opened"],
+                    "mult":   mult,
+                    "calc":   f"{data['count']} × {WEIGHTS['pr_opened']} × {mult}×",
+                    "pts":    round(data["pts"], 1),
+                    "color":  "authored_dim",
+                })
+        if lines_pts > 0:
+            score_components.append({
+                "label":  "Code volume",
+                "group":  "authored",
+                "count":  net_lines,
+                "weight": WEIGHTS["lines_per_1k"],
+                "mult":   None,
+                "calc":   f"{net_lines:,} lines ÷ 1000 × {WEIGHTS['lines_per_1k']}",
+                "pts":    lines_pts,
+                "color":  "authored_dim",
+            })
+        if files_pts > 0:
+            score_components.append({
+                "label":  "Files changed",
+                "group":  "authored",
+                "count":  e["total_files_changed"],
+                "weight": WEIGHTS["files_changed"],
+                "mult":   None,
+                "calc":   f"{e['total_files_changed']} files × {WEIGHTS['files_changed']}",
+                "pts":    files_pts,
+                "color":  "authored_dim",
+            })
+        if first_approval_pts > 0:
+            score_components.append({
+                "label":  "First approvals given",
+                "group":  "review",
+                "count":  e["first_approvals"],
+                "weight": WEIGHTS["first_approval"],
+                "mult":   None,
+                "calc":   f"{e['first_approvals']} × {WEIGHTS['first_approval']}pts",
+                "pts":    first_approval_pts,
+                "color":  "review",
+                "tip":    "First approval unblocks a PR for merge — the highest-value review action.",
+            })
+        if subseq_approval_pts > 0:
+            score_components.append({
+                "label":  "Subsequent approvals",
+                "group":  "review",
+                "count":  e["subsequent_approvals"],
+                "weight": WEIGHTS["subsequent_approval"],
+                "mult":   None,
+                "calc":   f"{e['subsequent_approvals']} × {WEIGHTS['subsequent_approval']}pts",
+                "pts":    subseq_approval_pts,
+                "color":  "review_dim",
+                "tip":    "PR was already approved — still positive, but not the unblocking event.",
+            })
+        if cr_body_pts > 0:
+            score_components.append({
+                "label":  "Change requests (with feedback)",
+                "group":  "review",
+                "count":  e["change_requests_with_body"],
+                "weight": WEIGHTS["change_request_body"],
+                "mult":   None,
+                "calc":   f"{e['change_requests_with_body']} × {WEIGHTS['change_request_body']}pts",
+                "pts":    cr_body_pts,
+                "color":  "review",
+                "tip":    "Written change request — highest signal review, provides actionable guidance.",
+            })
+        if cr_empty_pts > 0:
+            score_components.append({
+                "label":  "Change requests (no body)",
+                "group":  "review",
+                "count":  e["change_requests_empty"],
+                "weight": WEIGHTS["change_request_empty"],
+                "mult":   None,
+                "calc":   f"{e['change_requests_empty']} × {WEIGHTS['change_request_empty']}pts",
+                "pts":    cr_empty_pts,
+                "color":  "review_dim",
+            })
+        if comment_body_pts > 0:
+            score_components.append({
+                "label":  "Review comments (with body)",
+                "group":  "review",
+                "count":  e["comments_with_body"],
+                "weight": WEIGHTS["comment_body"],
+                "mult":   None,
+                "calc":   f"{e['comments_with_body']} × {WEIGHTS['comment_body']}pts",
+                "pts":    comment_body_pts,
+                "color":  "review_dim",
+                "tip":    "Substantive inline comment — shows engagement with the code.",
+            })
+        if comment_empty_pts > 0:
+            score_components.append({
+                "label":  "Review comments (empty)",
+                "group":  "review",
+                "count":  e["comments_empty"],
+                "weight": WEIGHTS["comment_empty"],
+                "mult":   None,
+                "calc":   f"{e['comments_empty']} × {WEIGHTS['comment_empty']}pts",
+                "pts":    comment_empty_pts,
+                "color":  "review_dim",
+            })
+        if breadth_pts > 0:
+            score_components.append({
+                "label":  "Review breadth (unique PRs)",
+                "group":  "review",
+                "count":  unique_prs_reviewed,
+                "weight": WEIGHTS["unique_prs_reviewed"],
+                "mult":   None,
+                "calc":   f"{unique_prs_reviewed} PRs × {WEIGHTS['unique_prs_reviewed']}pts",
+                "pts":    breadth_pts,
+                "color":  "review_dim",
+                "tip":    "Bonus for reviewing many different PRs — encourages broad team coverage.",
+            })
 
         # PR type breakdown for display
         pr_type_breakdown = [
@@ -410,6 +560,8 @@ def compute_impact(prs: list[dict]) -> list[dict]:
             "authored_score": round(authored_score, 1),
             "review_score": round(review_score, 1),
             "impact_score": total_score,
+            # exact per-component breakdown (used by dashboard)
+            "score_components": score_components,
         })
 
     results.sort(key=lambda x: x["impact_score"], reverse=True)
@@ -504,10 +656,38 @@ def main():
     impact = compute_impact(prs)
     repo_stats = compute_repo_stats(prs, impact)
 
+    # Recent PRs — top 10 per engineer (merged, sorted newest first)
+    # Stored flat so the dashboard can quickly look them up by author
+    top_logins = {e["login"] for e in impact[:10]}  # only store for top 10 to keep JSON small
+    recent_prs = [
+        {
+            "number":    p["number"],
+            "title":     p["title"],
+            "state":     p["state"],
+            "author":    p["author"],
+            "merged_at": p["merged_at"],
+            "url":       p["url"],
+        }
+        for p in sorted(
+            [p for p in prs if p["author"] in top_logins and not is_bot(p["author"])],
+            key=lambda p: p.get("merged_at") or p.get("updated_at") or "",
+            reverse=True,
+        )
+    ]
+    # Keep at most 15 per author
+    from collections import defaultdict as _dd
+    _counts: dict = _dd(int)
+    recent_prs_trimmed = []
+    for p in recent_prs:
+        if _counts[p["author"]] < 15:
+            recent_prs_trimmed.append(p)
+            _counts[p["author"]] += 1
+
     output = {
         "meta": meta,
         "repo_stats": repo_stats,
         "engineers": impact,
+        "recent_prs": recent_prs_trimmed,
         "weights": WEIGHTS,
         "pr_type_multipliers": PR_TYPE_MULTIPLIERS,
         "bot_logins": sorted(BOT_LOGINS),
